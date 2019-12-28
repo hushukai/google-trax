@@ -37,7 +37,6 @@ import six
 import tensorflow.compat.v2 as tf
 from trax import backend
 from trax import history as trax_history
-from trax import inputs as trax_inputs
 from trax import jaxboard
 from trax import layers as tl
 from trax import learning_rate as lr
@@ -46,6 +45,7 @@ from trax import utils
 from trax.backend import numpy as np
 from trax.backend import random as jax_random
 from trax.shapes import ShapeDtype
+from trax.supervised import inputs as trax_inputs
 
 
 TrainerState = collections.namedtuple('_TrainerState', [
@@ -63,6 +63,14 @@ OptState = collections.namedtuple('_OptState', [
 ])
 
 
+_DEFAULT_METRICS = {
+    'accuracy': tl.AccuracyScalar,
+    'neg_log_perplexity': tl.NegLogPerplexityScalar,
+    'loss': tl.CrossEntropyLossScalar,
+    'weights_per_batch_per_core': tl.CountWeights,
+}
+
+
 class Trainer(object):
   """Trax trainer.
 
@@ -72,40 +80,21 @@ class Trainer(object):
 
   def __init__(self, model, loss_fn, optimizer, lr_schedule, inputs,
                output_dir=None, random_seed=None, n_devices=None,
-               save_steps=None, should_save_checkpoints=True,
+               checkpoints_at=None, should_save_checkpoints=True,
                should_write_summaries=True, has_weights=False,
                nontrainable_param_map=None, mask_id=None, metrics=None):
-    if backend.get_name() == 'jax':
-      self._host_id = jax.host_id()
-      self._host_count = jax.host_count()
-    else:
-      self._host_id = 0
-      self._host_count = 1
-    self._is_chief = (self._host_id == 0)
 
-    if save_steps is None:
-      save_steps = []
-    self._save_steps = save_steps
-    self._should_save_checkpoints = should_save_checkpoints
+    self._is_chief, self._n_devices, rng = (
+        self._init_host_and_devices(n_devices, random_seed))
+    self._should_save_checkpoints = should_save_checkpoints and self._is_chief
+    self._checkpoints_at = checkpoints_at or []
     self._should_write_summaries = should_write_summaries
+
     self._has_weights = has_weights
     self._mask_id = mask_id
-    self._metrics_dict = _METRICS if metrics is None else metrics
+    self._metrics_dict = metrics if metrics is not None else _DEFAULT_METRICS
     loss_fn = loss_fn(has_weights=has_weights, mask_id=mask_id)
-    device_count = backend.device_count()
-    n_devices = n_devices or device_count
-    # TODO(lukaszkaiser): remove this restriction when possible.
-    if n_devices != device_count and backend.get_name() == 'jax':
-      raise ValueError('JAX cannot work yet with n_devices != all devices: '
-                       '%d != %d' % (n_devices, device_count))
-    self._n_devices = n_devices
-
-    # Simple differential seeding of RNG across hosts by host_id and time.
-    if random_seed is None and self._host_count > 1:
-      _, random_seed = divmod(int(time.time() * 1e6) +
-                              int(self._host_id * 1e6), 2**32)
-    rng = get_random_number_generator_and_set_seed(random_seed)
-    inputs = inputs(n_devices)
+    inputs = inputs(self._n_devices)
     self._inputs = inputs
 
     # Initialize the learning rate to a dummy value. It will be set in reset().
@@ -117,7 +106,7 @@ class Trainer(object):
 
     # Setup state.
     rng, init_rng = jax_random.split(rng)
-    self._rngs = np.stack(jax_random.split(rng, n_devices))
+    self._rngs = np.stack(jax_random.split(rng, self._n_devices))
     first_shape = inputs.input_shape[0]
     # If the inputs are a tuple/list, add [None] (batch) to each element.
     if isinstance(first_shape, (list, tuple)):
@@ -132,6 +121,7 @@ class Trainer(object):
     model_input_shape = backend.nested_map(lambda x: x or 1, model_input_shape)
     model_target_shape = backend.nested_map(lambda x: x or 1,
                                             model_target_shape)
+
     def new_opt_state_and_model_state(input_shape, input_dtype, target_shape,
                                       target_dtype, rng):
       """Returns optimizer and model states suitable for training a model."""
@@ -157,6 +147,7 @@ class Trainer(object):
       weights, state = m.init(input_signature)
       (slots, opt_params) = opt.tree_init(weights)
       return (OptState(weights, slots, opt_params), state)
+
     if _is_jit_init():
       # JIT parameter initialization to avoid memory fragmentation
       new_opt_state_and_model_state = backend.jit(new_opt_state_and_model_state,
@@ -166,44 +157,27 @@ class Trainer(object):
             model_input_shape, self._inputs.input_dtype,
             model_target_shape, self._inputs.target_dtype, init_rng))
 
-    # jit model_predict and update so they're fast
-    # TODO(lukaszkaiser): the code below creates a layer computing
-    # multiple metrics from a single model output; re-factor for clarity.
-    dup_layer = tl.Dup3() if self._has_weights else tl.Dup2()
-    def lower(layer):
-      """Apply layer below the current inputs, targets, and possibly weights."""
-      if self._has_weights:
-        # Apply layer below inputs, targets, and loss weights.
-        return tl.Parallel([], [], [], layer)
-      else:
-        # Apply layer below inputs and targets.
-        return tl.Parallel([], [], layer)
-    metrics_layer = []
+    # Arrange and initialize metrics layers.
     self._metrics = list(sorted(self._metrics_dict.keys()))
-    for i, m in enumerate(reversed(self._metrics)):
-      metric = self._metrics_dict[m](has_weights=self._has_weights,
-                                     mask_id=self._mask_id)
-      if i != len(self._metrics) - 1:
-        metrics_layer.append(dup_layer)
-        metrics_layer.append(lower(metric))
-      else:
-        metrics_layer.append(metric)
+    metrics_layers = [self._metrics_dict[m](has_weights=self._has_weights,
+                                            mask_id=self._mask_id)
+                      for m in self._metrics]
+    metrics_in_parallel = tl.Branch(*metrics_layers)
     # TODO(lukaszkaiser): clean this up once layer API stabilizes.
     # For now, we need to initialize metric layers somehow, so here we go.
     # We assume that they do not have any parameters, so this is a dummy.
     dummy_shapes = ((1, 2), (1,), (1,)) if self._has_weights else ((1, 2), (1,))
-    dummy_dtypes = [np.float32] * (3 if self._has_weights else 2)
-    dummy_signature = tuple(ShapeDtype(s, d)
-                            for s, d in zip(dummy_shapes, dummy_dtypes))
-    metrics_layer = tl.Serial(metrics_layer)
-    metrics_layer._set_rng_recursive(init_rng)  # pylint: disable=protected-access
-    metrics_weights, metrics_state = (
-        metrics_layer.init(dummy_signature))
-    self._metrics_weights = self._for_n_devices(metrics_weights)
-    self._metrics_state = self._for_n_devices(metrics_state)
+    dummy_signature = tuple(ShapeDtype(s) for s in dummy_shapes)
+    metrics_in_parallel._set_rng_recursive(init_rng)  # pylint: disable=protected-access
+    m_weights, m_state = metrics_in_parallel.init(dummy_signature)
+    self._metrics_weights = self._for_n_devices(m_weights)
+    self._metrics_state = self._for_n_devices(m_state)
+
+    # Jit model_predict and update so they're fast.
     self._jit_eval = _jit_predict_fn(
-        model_predict_eval, metrics_layer, n_devices)
-    self._jit_update_fn = _jit_update_fn(model_train, loss_fn, opt, n_devices)
+        model_predict_eval, metrics_in_parallel, self._n_devices)
+    self._jit_update_fn = _jit_update_fn(
+        model_train, loss_fn, opt, self._n_devices)
 
     self._model_train = model_train
     self._model_predict_eval = model_predict_eval
@@ -258,7 +232,7 @@ class Trainer(object):
     with backend.use_backend('numpy'):
       return self._lr_fn(self._step)
 
-  def reset(self, output_dir):
+  def reset(self, output_dir, init_checkpoint=None):
     """Reset the model parameters.
 
     Restores the parameters from the given output_dir if a checkpoint exists,
@@ -268,6 +242,7 @@ class Trainer(object):
 
     Args:
       output_dir: Output directory.
+      init_checkpoint: Initial checkpoint to use (default $output_dir/model.pkl)
     """
     self._output_dir = output_dir
     tf.io.gfile.makedirs(output_dir)
@@ -286,7 +261,7 @@ class Trainer(object):
     self._train_eval_stream = _repeat_stream(self._inputs.train_eval_stream)
 
     # Restore the training state.
-    state = load_trainer_state(output_dir)
+    state = load_trainer_state(output_dir, init_checkpoint)
     self._step = state.step or 0
     history = state.history
     self._lr_fn = self._lr_schedule(history)
@@ -299,7 +274,7 @@ class Trainer(object):
       model_state = self._for_n_devices(model_state)
     self._opt_state = OptState(*self._for_n_devices(opt_state))
     self._model_state = model_state
-    if not state.opt_state and self._should_save():
+    if not state.opt_state and self._should_save_checkpoints:
       self.save_state(keep=False)
 
     self.update_nontrainable_params()
@@ -333,7 +308,7 @@ class Trainer(object):
     self.evaluate(n_eval_steps)
     if self._eval_sw:
       self._eval_sw.flush()
-    if self._should_save():
+    if self._should_save_checkpoints:
       self.save_state(keep=False)
 
   def train_step(self, batch):
@@ -508,6 +483,39 @@ class Trainer(object):
     total_size = _nested_reduce(sum, sizes)
     self.log_step('Total number of trainable weights: %d' % total_size)
 
+  def _init_host_and_devices(self, n_devices=None, random_seed=None):
+    """Initializes host and device attributes for this trainer.
+
+    Args:
+      n_devices: Number of devices this trainer will use. If `None`, get the
+          number from the backend.
+      random_seed: Random seed as the starting point for all random numbers used
+          by the trainer. If `None`, calculate one from system time and host id.
+
+    Returns:
+      is_chief: True if this trainer has special chief responsibilities.
+      n_devices: The passed in value of n_devices or a computed default.
+      random_seed: The passed in value of random_seed or a computed default.
+    """
+    if backend.get_name() == 'jax':
+      host_id = jax.host_id()
+      host_count = jax.host_count()
+    else:
+      host_id = 0
+      host_count = 1
+    is_chief = (host_id == 0)
+
+    device_count = backend.device_count()
+    n_devices = n_devices or device_count
+    # TODO(lukaszkaiser): remove this restriction when possible.
+    if n_devices != device_count and backend.get_name() == 'jax':
+      raise ValueError('JAX cannot work yet with n_devices != all devices: '
+                       '%d != %d' % (n_devices, device_count))
+
+    if random_seed is None and host_count > 1:
+      random_seed = int(1e6 * (host_id + time.time())) % 2**32
+    return is_chief, n_devices, init_random_number_generators(random_seed)
+
   def _map_to_state_dicts(self, f):
     """Map the function f to all dicts in model state."""
     # TODO(jonni): Can we replace _nested_map with backend.nested_map?
@@ -527,11 +535,8 @@ class Trainer(object):
     value = state_dict[key]
     return {key: self.update_model_state(key, value)}
 
-  def _should_save(self):
-    return self._is_chief and self._should_save_checkpoints
-
   def _should_save_now(self):
-    return self._should_save() and self._step in self._save_steps
+    return self._should_save_checkpoints and self._step in self._checkpoints_at
 
   def _should_log_now(self):
     return (self._train_sw is not None
@@ -558,8 +563,8 @@ def train(output_dir,
           optimizer=trax_opt.Adafactor,
           lr_schedule=lr.MultifactorSchedule,
           trainer_class=Trainer,
-          train_steps=1000,
-          save_steps=None,
+          steps=1000,
+          checkpoints_at=None,
           eval_steps=10,
           eval_frequency=100,
           random_seed=None,
@@ -582,9 +587,9 @@ def train(output_dir,
     lr_schedule: A learning rate schedule as a function that takes history and
       returns a function from step to learning rate (a float).
     trainer_class: The trainer class to use.
-    train_steps: int, total number of training steps.
-    save_steps: list of integers. Keep a model file at each of the supplied save
-      steps.
+    steps: int, total number of training steps.
+    checkpoints_at: list of integers. Save a checkpoint for each training step
+      in the list.
     eval_steps: int, num of steps per evaluation. If None or 0, eval disabled.
     eval_frequency: int, how often to run evaluation (every eval_frequency
       steps). If None or 0, eval disabled.
@@ -605,11 +610,12 @@ def train(output_dir,
   trainer = trainer_class(model, loss_fn, optimizer, lr_schedule, inputs,
                           output_dir,
                           random_seed=random_seed, n_devices=n_devices,
-                          save_steps=save_steps, has_weights=has_weights,
+                          checkpoints_at=checkpoints_at,
+                          has_weights=has_weights,
                           nontrainable_param_map=nontrainable_param_map,
                           metrics=metrics, mask_id=mask_id)
 
-  epoch_steps = [train_steps]  # Only training if eval_frequency is 0 or None
+  epoch_steps = [steps]  # Only training if eval_frequency is 0 or None
   if eval_frequency and eval_steps > 0:
     epoch_steps = itertools.chain([1,  # first epoch only 1 step
                                    eval_frequency - 1],
@@ -617,7 +623,7 @@ def train(output_dir,
   trainer.log_step('Starting training using %d devices' % trainer.n_devices)
   trainer.print_n_weights()
 
-  for epoch_steps in epochs(train_steps, trainer.step, epoch_steps):
+  for epoch_steps in epochs(steps, trainer.step, epoch_steps):
     trainer.train_epoch(epoch_steps, eval_steps)
 
     # Update nontrainable parameters with new history
@@ -779,12 +785,15 @@ def epochs(total_steps, steps_to_skip, epoch_steps):
       break
 
 
-def load_trainer_state(output_dir):
+def load_trainer_state(output_dir, weights_file=None):
   """Returns a TrainerState instance loaded from the given `output_dir`."""
-  weights_file = os.path.join(output_dir, 'model.pkl')
-  if not tf.io.gfile.exists(weights_file):
-    return TrainerState(step=None, opt_state=None,
-                        history=trax_history.History(), model_state=None)
+  if weights_file is None:
+    weights_file = os.path.join(output_dir, 'model.pkl')
+    if not tf.io.gfile.exists(weights_file):
+      return TrainerState(step=None, opt_state=None,
+                          history=trax_history.History(), model_state=None)
+  elif not tf.io.gfile.exists(weights_file):
+    raise ValueError('File not found: %s' % weights_file)
 
   pkl_module = utils.get_pickle_module()
   with tf.io.gfile.GFile(weights_file, 'rb') as f:
@@ -795,15 +804,14 @@ def load_trainer_state(output_dir):
                       history=history, model_state=model_state)
 
 
-def get_random_number_generator_and_set_seed(seed=None):
-  """Get a JAX random number generator and set random seed everywhere."""
+def init_random_number_generators(seed=None):
+  """Initializes random generators for Python, NumPy, TensorFlow, and JAX."""
+  # Seed Python random (None as seed is okay), then use it to seed the others.
   random.seed(seed)
-  # While python random accepts None as seed and uses time/os seed then,
-  # some other functions expect integers so we create one here.
   if seed is None:
     seed = random.randint(0, 2**31 - 1)
-  tf.random.set_seed(seed)
   numpy.random.seed(seed)
+  tf.random.set_seed(seed)
   return jax_random.get_prng(seed)
 
 
@@ -905,15 +913,6 @@ def _sizes(x):
     except Exception:  # pylint: disable=broad-except
       return 0
   return backend.nested_map(size, x)
-
-
-# Metrics to calculate and report.
-_METRICS = {
-    'accuracy': tl.AccuracyScalar,
-    'neg_log_perplexity': tl.NegLogPerplexityScalar,
-    'loss': tl.CrossEntropyLossScalar,
-    'weights_per_batch_per_core': tl.CountWeights,
-}
 
 
 def _repeat_stream(stream):

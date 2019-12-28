@@ -29,20 +29,20 @@ from jax import random as jax_random
 import numpy as np
 from tensorflow import test
 from tensorflow.io import gfile
-from trax import inputs
 from trax import layers
 from trax import models
-from trax import trainer_lib
 from trax.rl import ppo
 from trax.rl import serialization_utils
 from trax.shapes import ShapeDtype
+from trax.supervised import inputs
+from trax.supervised import trainer_lib
 
 
 class PpoTest(test.TestCase):
 
   def setUp(self):
     super(PpoTest, self).setUp()
-    self.rng_key = trainer_lib.get_random_number_generator_and_set_seed(0)
+    self.rng_key = trainer_lib.init_random_number_generators(0)
 
   def test_get_policy_model_files(self):
     output_dir = self.get_temp_dir()
@@ -598,7 +598,7 @@ class PpoTest(test.TestCase):
         inputs=functools.partial(
             inputs.random_inputs, input_shape=(1, 1), output_shape=(1, 1)
         ),
-        train_steps=1,
+        steps=1,
         eval_steps=1,
     )
 

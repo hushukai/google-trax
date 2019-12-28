@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import trax.inputs
 import trax.learning_rate
 import trax.models
 import trax.optimizers
-import trax.trainer_lib
+import trax.supervised.inputs
+import trax.supervised.trainer_lib
 
 # Parameters for batch_fn:
 # ==============================================================================
@@ -46,4 +46,4 @@ train.optimizer = @trax.optimizers.Adafactor
 train.eval_frequency = 200
 train.eval_steps = 10
 train.model = @trax.models.MLP
-train.train_steps = 2000
+train.steps = 2000

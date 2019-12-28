@@ -13,13 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Trax top level import."""
+"""SGD optimizer class."""
 
-from trax import backend as math
-from trax import layers
-from trax import learning_rate as lr
-from trax import optimizers
-from trax import shapes
-from trax.supervised import inputs
-from trax.supervised import trainer_lib as supervised
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
 
+from trax.optimizers import base as opt_base
+
+
+class SGD(opt_base.Optimizer):
+  """Plain SGD optimizer."""
+
+  def init(self, params):
+    return None
+
+  def update(self, step, grads, weights, slots, opt_params):
+    del step
+    del slots
+    learning_rate = opt_params['learning_rate']
+    return weights - (learning_rate * grads).astype(weights.dtype), None
